@@ -1,0 +1,268 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageTk
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+import cv2
+import numpy as np
+import os
+from datetime import datetime
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+import json
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# -----------------------
+# Device setup
+# -----------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -----------------------
+# Load model (8 classes)
+# -----------------------
+model = models.resnet18(weights=None)
+num_ftrs = model.fc.in_features
+model.fc = nn.Linear(num_ftrs, 8)
+model.load_state_dict(torch.load("resnet18_kvasir.pth", map_location=device))
+model = model.to(device)
+model.eval()
+
+# -----------------------
+# Class names
+# -----------------------
+class_names = [
+    "dyed-lifted-polyps", "dyed-resection-margins", "esophagitis",
+    "normal-cecum", "normal-pylorus", "normal-z-line", "polyps", "ulcerative-colitis"
+]
+
+cancerous = ["dyed-lifted-polyps", "dyed-resection-margins", "polyps"]
+non_cancerous = ["esophagitis", "normal-cecum", "normal-pylorus", "normal-z-line", "ulcerative-colitis"]
+
+# -----------------------
+# Transforms
+# -----------------------
+transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406], [0.229,0.224,0.225])
+])
+
+# -----------------------
+# Grad-CAM
+# -----------------------
+def generate_gradcam(model, img_tensor, target_class, layer_name="layer4"):
+    gradients, activations = [], []
+
+    def backward_hook(module, grad_in, grad_out):
+        gradients.append(grad_out[0])
+    def forward_hook(module, input, output):
+        activations.append(output)
+
+    target_layer = dict([*model.named_modules()])[layer_name]
+    target_layer.register_forward_hook(forward_hook)
+    target_layer.register_backward_hook(backward_hook)
+
+    img_tensor = img_tensor.unsqueeze(0).to(device)
+    output = model(img_tensor)
+    model.zero_grad()
+    one_hot = torch.zeros_like(output)
+    one_hot[0, target_class] = 1
+    output.backward(gradient=one_hot)
+
+    grad = gradients[0].cpu().data.numpy()[0]
+    act = activations[0].cpu().data.numpy()[0]
+
+    weights = np.mean(grad, axis=(1,2))
+    cam = np.zeros(act.shape[1:], dtype=np.float32)
+    for i, w in enumerate(weights):
+        cam += w * act[i]
+
+    cam = np.maximum(cam, 0)
+    cam = cv2.resize(cam, (224,224))
+    cam = cam - np.min(cam)
+    cam = cam / np.max(cam)
+
+    img = img_tensor.cpu().squeeze().permute(1,2,0).numpy()
+    img = img * np.array([0.229,0.224,0.225]) + np.array([0.485,0.456,0.406])
+    img = np.clip(img, 0, 1)
+
+    heatmap = cv2.applyColorMap(np.uint8(255*cam), cv2.COLORMAP_JET)
+    heatmap = np.float32(heatmap)/255
+    overlay = heatmap + img
+    overlay = overlay / np.max(overlay)
+    overlay = np.uint8(overlay*255)
+
+    return overlay
+
+# -----------------------
+# Prediction
+# -----------------------
+def predict_image(image_path):
+    image = Image.open(image_path).convert("RGB")
+    img_tensor = transform(image)
+
+    with torch.no_grad():
+        outputs = model(img_tensor.unsqueeze(0).to(device))
+        _, preds = torch.max(outputs, 1)
+        pred_class = class_names[preds.item()]
+
+    if pred_class in cancerous:
+        final_label = "Cancerous"
+    else:
+        final_label = "Non-Cancerous"
+
+    gradcam_img = generate_gradcam(model, img_tensor, preds.item())
+
+    return pred_class, final_label, gradcam_img, image
+
+# -----------------------
+# Save PDF Report
+# -----------------------
+def save_pdf(filepath, pred_class, final_label, gradcam_img, orig_img):
+    reports_dir = os.path.join(os.getcwd(), "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+
+    report_name = os.path.join(reports_dir, f"Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
+
+    c = canvas.Canvas(report_name, pagesize=A4)
+    width, height = A4
+
+    # Title
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(200, height - 50, "Medical Cancer Detection Report")
+
+    # Date
+    c.setFont("Helvetica", 10)
+    c.drawString(50, height - 80, f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Results
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(50, height - 120, f"Predicted Class: {pred_class}")
+    c.drawString(50, height - 140, f"Final Conclusion: {final_label}")
+
+    # Save temp images
+    orig_path = "temp_orig.jpg"
+    grad_path = "temp_grad.jpg"
+    orig_img.resize((224,224)).save(orig_path)
+    Image.fromarray(cv2.cvtColor(gradcam_img, cv2.COLOR_BGR2RGB)).resize((224,224)).save(grad_path)
+
+    # Add images to PDF
+    c.drawImage(orig_path, 50, height - 380, width=200, height=200)
+    c.drawImage(grad_path, 300, height - 380, width=200, height=200)
+
+    # Footer
+    c.setFont("Helvetica-Oblique", 10)
+    c.drawString(200, 30, "Generated by AI-based Medical Imaging System")
+
+    c.save()
+    messagebox.showinfo("PDF Saved", f"Report saved as:\n{report_name}")
+
+# -----------------------
+# Show Metrics Dashboard
+# -----------------------
+def show_metrics():
+    try:
+        with open("metrics.json", "r") as f:
+            metrics = json.load(f)
+
+        # Print in console
+        print("\n--- Classification Report ---")
+        for cls, vals in metrics.items():
+            if isinstance(vals, dict) and "precision" in vals:
+                print(f"{cls} → Precision: {vals['precision']:.2f}, Recall: {vals['recall']:.2f}, F1: {vals['f1-score']:.2f}")
+
+        # Plot heatmap if confusion matrix exists
+        if "confusion_matrix" in metrics:
+            cm = np.array(metrics["confusion_matrix"])
+            plt.figure(figsize=(6,5))
+            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                        xticklabels=class_names, yticklabels=class_names)
+            plt.title("Confusion Matrix")
+            plt.show()
+        else:
+            messagebox.showinfo("Metrics", "Metrics loaded successfully! Check console for details.")
+
+        # -----------------------
+        # Show ROC Curve
+        # -----------------------
+        import os
+        if os.path.exists("roc_curve.png"):
+            img = Image.open("roc_curve.png")
+            img = img.resize((500, 400))
+
+            img.show()   # simple pop-up display
+
+        else:
+            print("ROC curve not found. Run metrics file first.")
+            
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not load metrics.json\n{e}")
+
+# -----------------------
+# GUI Functions
+# -----------------------
+def open_file():
+    global last_pred, last_final, last_gradcam, last_img
+    filepath = filedialog.askopenfilename(filetypes=[("Image files", "*.jpg *.png *.jpeg")])
+    if not filepath:
+        return
+
+    pred_class, final_label, gradcam_img, pil_img = predict_image(filepath)
+
+    img_disp = pil_img.resize((224,224))
+    img_tk = ImageTk.PhotoImage(img_disp)
+    panel1.config(image=img_tk)
+    panel1.image = img_tk
+
+    grad_disp = Image.fromarray(cv2.cvtColor(gradcam_img, cv2.COLOR_BGR2RGB)).resize((224,224))
+    grad_tk = ImageTk.PhotoImage(grad_disp)
+    panel2.config(image=grad_tk)
+    panel2.image = grad_tk
+
+    result_label.config(text=f"Detected: {pred_class}\nConclusion: {final_label}")
+
+    last_pred, last_final, last_gradcam, last_img = pred_class, final_label, gradcam_img, pil_img
+
+def export_report():
+    if last_pred is None:
+        messagebox.showerror("Error", "Please upload and analyze an image first.")
+        return
+    save_pdf("report.pdf", last_pred, last_final, last_gradcam, last_img)
+
+# -----------------------
+# GUI Setup
+# -----------------------
+last_pred, last_final, last_gradcam, last_img = None, None, None, None
+
+root = tk.Tk()
+root.title("🩺 Cancer Detection with Grad-CAM")
+root.geometry("700x600")
+root.configure(bg="white")
+
+title = tk.Label(root, text="Medical Image Classifier", font=("Arial", 18, "bold"), bg="white", fg="darkblue")
+title.pack(pady=10)
+
+btn = tk.Button(root, text="Upload Image", command=open_file, font=("Arial", 12), bg="lightblue")
+btn.pack(pady=5)
+
+btn2 = tk.Button(root, text="Export Report (PDF)", command=export_report, font=("Arial", 12), bg="lightgreen")
+btn2.pack(pady=5)
+
+metrics_btn = tk.Button(root, text="Show Metrics Dashboard", command=show_metrics, bg="orange", fg="white", font=("Arial", 12, "bold"))
+metrics_btn.pack(pady=10)
+
+frame = tk.Frame(root, bg="white")
+frame.pack()
+
+panel1 = tk.Label(frame, bg="white")
+panel1.grid(row=0, column=0, padx=10)
+
+panel2 = tk.Label(frame, bg="white")
+panel2.grid(row=0, column=1, padx=10)
+
+result_label = tk.Label(root, text="", font=("Arial", 14), bg="white", fg="black")
+result_label.pack(pady=20)
+
+root.mainloop()
