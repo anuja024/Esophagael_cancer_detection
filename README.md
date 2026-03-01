@@ -47,13 +47,13 @@ This project focuses on detecting gastrointestinal diseases using deep learning 
 ##  Results & Visualizations
 
 ### ROC Curve
-![ROC Curve](outputs/roc curve.png)
+![ROC Curve](outputs/roc_curve.png)
 
 ### Grad-CAM Visualization
-![GradCAM](outputs/gradCam heatmap.jpg)
+![GradCAM](outputs/gradCam_heatmap.jpg)
 
 ### GUI Output
-![GUI](outputs/gui interface.png)
+![GUI](outputs/gui_interface.png)
 ---
 
 ##  How to Run
