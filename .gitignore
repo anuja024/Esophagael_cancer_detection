@@ -2,6 +2,5 @@ train/
 val/
 *.jpg
 *.png
-*.pth
 __pycache__/
 *.pkl
