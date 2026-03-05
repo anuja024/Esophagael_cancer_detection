@@ -63,11 +63,11 @@ def load_model(model_name):
     if model_name == "ResNet18":
         model = models.resnet18(weights=None)
         model.fc = nn.Linear(model.fc.in_features, 8)
-        model.load_state_dict(torch.load("resnet18_kvasir.pth", map_location=device))
+        model.load_state_dict(torch.load("resnet18_kvasir.pth", map_location="cpu"))
     else:
         model = models.mobilenet_v2(weights=None)
         model.classifier[1] = nn.Linear(model.last_channel, 8)
-        model.load_state_dict(torch.load("mobilenet_kvasir.pth", map_location=device))
+        model.load_state_dict(torch.load("mobilenet_kvasir.pth", map_location="cpu"))
 
     model = model.to(device)
     model.eval()
